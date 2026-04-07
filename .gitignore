@@ -1,0 +1,22 @@
+# AI Memories
+.claude/
+
+# API Keys and Secrets
+.env
+keys.json
+TradeBot.key
+
+
+# Python & Jupyter Clutter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Massive Data Files
+*.csv
+*.db
+*.png
+*.log
+*.txt
