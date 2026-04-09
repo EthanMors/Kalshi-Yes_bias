@@ -20,7 +20,7 @@ Add an order book data logging module to my existing Kalshi trading bot. This mo
 ### Raw Fields from API (per snapshot)
 | Column | Name | Description |
 |--------|------|-------------|
-| 1 | `timestamp` | UTC timestamp of the snapshot (ISO 8601 format, millisecond precision) |
+| 1 | `timestamp` | PST timestamp of the snapshot (ISO 8601 format, millisecond precision) |
 | 2 | `market_id` | The Kalshi market ticker/ID string |
 | 3 | `city` | City name (derived from market ticker) |
 | 4 | `strike_temp` | The temperature threshold for this contract (e.g., 85) |

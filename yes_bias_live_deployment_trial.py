@@ -18,6 +18,7 @@
 #   # pip install pykalshi
 
 import asyncio
+import json
 import math
 import csv
 import logging
@@ -33,7 +34,8 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import pandas as pd
 from pykalshi import AsyncKalshiClient, AsyncRateLimiter
-from pykalshi.enums import Action, Side, MarketStatus, OrderStatus
+from pykalshi.enums import Action, Side, MarketStatus, OrderStatus, OrderType
+from pykalshi.portfolio import Portfolio as _Portfolio
 from pykalshi.exceptions import (
     KalshiAPIError,
     InsufficientFundsError,
@@ -85,6 +87,7 @@ CSV_LOG_PATH        = Path(__file__).parent / "Yes_bias_live_trade_data.csv"
 SETTLEMENT_LOG_PATH = Path(__file__).parent / "settlement_log.csv"
 LOG_FILE            = Path(__file__).parent / "yes_bias_bot.log"
 LOG_LEVEL           = logging.INFO
+JSON_LOG_DIR        = Path(__file__).parent / "JSON_logs"
 
 # ── Settlement log columns ────────────────────────────────────────────────────────
 SETTLEMENT_COLUMNS = [
@@ -130,6 +133,7 @@ def setup_logging() -> None:
             logging.FileHandler(LOG_FILE, encoding="utf-8"),
         ],
     )
+    JSON_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -406,14 +410,55 @@ async def place_no_order(
         f"place_no_order | {market.ticker} | pls={pls} | "
         f"raw={no_price_dollars} → snapped={no_price_str}"
     )
-    return await kalshi.portfolio.place_order(
-        ticker          = market,       # Market object — triggers tick validation in pykalshi
-        action          = Action.BUY,
-        side            = Side.NO,
-        count_fp        = count_fp,
-        no_price_dollars= no_price_str,
-        client_order_id = client_order_id,
-    )
+
+    # Capture the exact request body before submission for audit logging.
+    try:
+        _request_body = _Portfolio._build_order_data(
+            market,
+            Action.BUY,
+            Side.NO,
+            count_fp,
+            no_price_dollars=no_price_str,
+            client_order_id=client_order_id,
+        )
+    except Exception as _bd_exc:
+        logging.warning(f"place_no_order: could not build order data for log: {_bd_exc}")
+        _request_body = {}
+
+    _ticker_str = getattr(market, "ticker", str(market))
+    _market_type = "bracket" if re.search(r"-B\d", _ticker_str) else "threshold"
+
+    try:
+        result = await kalshi.portfolio.place_order(
+            ticker          = market,
+            action          = Action.BUY,
+            side            = Side.NO,
+            count_fp        = count_fp,
+            no_price_dollars= no_price_str,
+            client_order_id = client_order_id,
+        )
+    except Exception as exc:
+        _write_jsonl_log({
+            "timestamp_utc": datetime.now(tz=timezone.utc).isoformat(),
+            "event":         "order_error",
+            "ticker":        _ticker_str,
+            "market_type":   _market_type,
+            "request_body":  _request_body,
+            "error_type":    type(exc).__name__,
+            "error_message": str(exc),
+        })
+        raise
+
+    _write_jsonl_log({
+        "timestamp_utc":    datetime.now(tz=timezone.utc).isoformat(),
+        "event":            "order_placed",
+        "ticker":           _ticker_str,
+        "market_type":      _market_type,
+        "request_body":     _request_body,
+        "response_order_id": result.order_id,
+        "response_status":  result.status.value if hasattr(result.status, "value") else str(result.status),
+    })
+    return result
 
 
 async def place_yes_sell_order(
@@ -446,14 +491,55 @@ async def place_yes_sell_order(
         f"place_yes_sell_order | {market.ticker} | pls={pls} | "
         f"raw={yes_price_dollars} → snapped={yes_price_str}"
     )
-    return await kalshi.portfolio.place_order(
-        ticker           = market,
-        action           = Action.SELL,
-        side             = Side.YES,
-        count_fp         = count_fp,
-        yes_price_dollars= yes_price_str,
-        client_order_id  = client_order_id,
-    )
+
+    # Capture the exact request body before submission for audit logging.
+    try:
+        _request_body = _Portfolio._build_order_data(
+            market,
+            Action.SELL,
+            Side.YES,
+            count_fp,
+            yes_price_dollars=yes_price_str,
+            client_order_id=client_order_id,
+        )
+    except Exception as _bd_exc:
+        logging.warning(f"place_yes_sell_order: could not build order data for log: {_bd_exc}")
+        _request_body = {}
+
+    _ticker_str = getattr(market, "ticker", str(market))
+    _market_type = "bracket" if re.search(r"-B\d", _ticker_str) else "threshold"
+
+    try:
+        result = await kalshi.portfolio.place_order(
+            ticker           = market,
+            action           = Action.SELL,
+            side             = Side.YES,
+            count_fp         = count_fp,
+            yes_price_dollars= yes_price_str,
+            client_order_id  = client_order_id,
+        )
+    except Exception as exc:
+        _write_jsonl_log({
+            "timestamp_utc": datetime.now(tz=timezone.utc).isoformat(),
+            "event":         "order_error",
+            "ticker":        _ticker_str,
+            "market_type":   _market_type,
+            "request_body":  _request_body,
+            "error_type":    type(exc).__name__,
+            "error_message": str(exc),
+        })
+        raise
+
+    _write_jsonl_log({
+        "timestamp_utc":    datetime.now(tz=timezone.utc).isoformat(),
+        "event":            "order_placed",
+        "ticker":           _ticker_str,
+        "market_type":      _market_type,
+        "request_body":     _request_body,
+        "response_order_id": result.order_id,
+        "response_status":  result.status.value if hasattr(result.status, "value") else str(result.status),
+    })
+    return result
 
 
 async def get_order_status(kalshi: AsyncKalshiClient, order_id: str) -> object:
@@ -505,6 +591,25 @@ def log_row(writer: csv.DictWriter, row: dict) -> None:
     # DictWriter does not expose the underlying file directly; flush via
     # the writer's internal reference stored in the calling scope.
     # Flushing is handled by the caller using csv_file.flush().
+
+
+def _write_jsonl_log(record: dict) -> None:
+    """Append one JSON record (one line) to the date-labelled JSONL log file.
+
+    The file lives at JSON_logs/YYYY-MM-DD.jsonl (UTC date).  All errors are
+    swallowed with a WARNING so that logging can NEVER crash the bot.
+
+    Args:
+        record: Arbitrary dict that will be serialised to a single JSON line.
+    """
+    try:
+        utc_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        log_path = JSON_LOG_DIR / f"{utc_date}.jsonl"
+        line = json.dumps(record, default=str) + "\n"
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception as exc:
+        logging.warning(f"_write_jsonl_log failed (record not saved): {exc}")
 
 
 def _blank_row(ticker: str, city: str, trade: dict) -> dict:
