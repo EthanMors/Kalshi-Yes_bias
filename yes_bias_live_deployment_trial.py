@@ -53,8 +53,6 @@ MAX_CONTRACTS    = 1             # cap at 1 for live trial
 # ── Strategy parameters ──────────────────────────────────────────────────────────
 YES_PRICE_LOW    = 0.55
 YES_PRICE_HIGH   = 0.65
-SLIPPAGE_BUFFER  = 0.01          # 1 tick (1 cent) above best no ask
-
 # NO price valid range (derived from YES range): 1 - YES_PRICE_HIGH to 1 - YES_PRICE_LOW
 NO_PRICE_LOW     = round(1.0 - YES_PRICE_HIGH, 2)   # 0.35
 NO_PRICE_HIGH    = round(1.0 - YES_PRICE_LOW,  2)   # 0.45
@@ -306,29 +304,6 @@ def snap_to_tick(price_dollars: float, market) -> str:
     return f"{snapped:.{decimal_places}f}"
 
 
-def is_bracket_market(market) -> bool:
-    """Return True if *market* is a bracket market (e.g. KXHIGHLAX-26MAR16-B72.5).
-
-    Detection uses the ticker string: bracket tickers contain '-B' followed by a
-    digit; threshold tickers contain '-T' followed by a digit.  The ticker regex
-    is the authoritative check; market_type is consulted as a secondary signal.
-
-    Args:
-        market: Market object with a .ticker attribute.
-
-    Returns:
-        True for bracket markets, False for threshold markets.
-    """
-    ticker = getattr(market, "ticker", "") or ""
-    if re.search(r"-B\d", ticker):
-        return True
-    if re.search(r"-T\d", ticker):
-        return False
-    # Fallback: inspect market_type if ticker pattern is inconclusive.
-    mtype = getattr(market, "market_type", None) or ""
-    return "bracket" in mtype.lower()
-
-
 async def get_best_no_ask(kalshi: AsyncKalshiClient, market) -> float | None:
     """Return the best (lowest) NO ask price snapped to the market tick, or None.
 
@@ -347,33 +322,6 @@ async def get_best_no_ask(kalshi: AsyncKalshiClient, market) -> float | None:
         best_bid = book.best_yes_bid   # best YES bid, dollar string or None
         if best_bid is not None:
             raw = float(Decimal("1") - Decimal(best_bid))
-            return float(snap_to_tick(raw, market))
-    except Exception as exc:
-        logging.warning(f"Could not fetch order book for {market.ticker}: {exc}")
-    return None
-
-
-async def get_best_yes_ask(kalshi: AsyncKalshiClient, market) -> float | None:
-    """Return the best (lowest) YES ask price snapped to the market tick, or None.
-
-    On Kalshi, YES ask = 1.00 - best NO bid.
-    pykalshi's OrderbookResponse.best_yes_ask computes this automatically.
-
-    Used for bracket markets where the strategy sells YES contracts one tick
-    below the current best YES ask.
-
-    Args:
-        kalshi: Authenticated AsyncKalshiClient instance.
-        market: Market object returned by kalshi.get_market().
-
-    Returns:
-        Best YES ask snapped to the market's tick grid (e.g. 0.60), or None.
-    """
-    try:
-        book = await market.get_orderbook()
-        best_ask_str = book.best_yes_ask   # str | None, e.g. "0.60"
-        if best_ask_str is not None:
-            raw = float(Decimal(best_ask_str))
             return float(snap_to_tick(raw, market))
     except Exception as exc:
         logging.warning(f"Could not fetch order book for {market.ticker}: {exc}")
@@ -426,7 +374,7 @@ async def place_no_order(
         _request_body = {}
 
     _ticker_str = getattr(market, "ticker", str(market))
-    _market_type = "bracket" if re.search(r"-B\d", _ticker_str) else "threshold"
+    _market_type = "bracket" if re.search(r"-B\d", _ticker_str) else "threshold"  # informational only
 
     try:
         result = await kalshi.portfolio.place_order(
@@ -436,87 +384,6 @@ async def place_no_order(
             count_fp        = count_fp,
             no_price_dollars= no_price_str,
             client_order_id = client_order_id,
-        )
-    except Exception as exc:
-        _write_jsonl_log({
-            "timestamp_utc": datetime.now(tz=timezone.utc).isoformat(),
-            "event":         "order_error",
-            "ticker":        _ticker_str,
-            "market_type":   _market_type,
-            "request_body":  _request_body,
-            "error_type":    type(exc).__name__,
-            "error_message": str(exc),
-        })
-        raise
-
-    _write_jsonl_log({
-        "timestamp_utc":    datetime.now(tz=timezone.utc).isoformat(),
-        "event":            "order_placed",
-        "ticker":           _ticker_str,
-        "market_type":      _market_type,
-        "request_body":     _request_body,
-        "response_order_id": result.order_id,
-        "response_status":  result.status.value if hasattr(result.status, "value") else str(result.status),
-    })
-    return result
-
-
-async def place_yes_sell_order(
-    kalshi: AsyncKalshiClient,
-    market: object,
-    count: int,
-    yes_price_dollars: float,
-    client_order_id: str,
-) -> object:
-    """Submit a limit sell-YES order via pykalshi (bracket markets only).
-
-    Used for bracket markets where the strategy sells YES contracts at one tick
-    below the current best YES ask, fading retail YES over-payment.
-
-    Args:
-        kalshi:            Authenticated AsyncKalshiClient instance.
-        market:            Market object from kalshi.get_market() — enables pykalshi
-                           tick-size validation (skipped when a string is passed).
-        count:             Number of whole contracts.
-        yes_price_dollars: Limit price in dollars (e.g. 0.59). Snapped to tick grid.
-        client_order_id:   Idempotency key.
-
-    Returns:
-        pykalshi AsyncOrder object.
-    """
-    count_fp = f"{count}.00"
-    yes_price_str = snap_to_tick(yes_price_dollars, market)
-    pls = getattr(market, "price_level_structure", "linear_cent") or "linear_cent"
-    logging.debug(
-        f"place_yes_sell_order | {market.ticker} | pls={pls} | "
-        f"raw={yes_price_dollars} → snapped={yes_price_str}"
-    )
-
-    # Capture the exact request body before submission for audit logging.
-    try:
-        _request_body = _Portfolio._build_order_data(
-            market,
-            Action.SELL,
-            Side.YES,
-            count_fp,
-            yes_price_dollars=yes_price_str,
-            client_order_id=client_order_id,
-        )
-    except Exception as _bd_exc:
-        logging.warning(f"place_yes_sell_order: could not build order data for log: {_bd_exc}")
-        _request_body = {}
-
-    _ticker_str = getattr(market, "ticker", str(market))
-    _market_type = "bracket" if re.search(r"-B\d", _ticker_str) else "threshold"
-
-    try:
-        result = await kalshi.portfolio.place_order(
-            ticker           = market,
-            action           = Action.SELL,
-            side             = Side.YES,
-            count_fp         = count_fp,
-            yes_price_dollars= yes_price_str,
-            client_order_id  = client_order_id,
         )
     except Exception as exc:
         _write_jsonl_log({
@@ -756,21 +623,6 @@ def _is_no_price_in_range(no_price: float) -> bool:
     return NO_PRICE_LOW <= round(no_price, 2) <= NO_PRICE_HIGH
 
 
-def _is_yes_price_in_range(yes_price: float) -> bool:
-    """Return True if the YES price is still within the valid entry band.
-
-    Used for bracket markets where we sell YES contracts.  The valid YES ask
-    range mirrors the signal band: [YES_PRICE_LOW, YES_PRICE_HIGH] = [0.55, 0.65].
-
-    Args:
-        yes_price: YES price in dollars.
-
-    Returns:
-        True if within valid range.
-    """
-    return YES_PRICE_LOW <= round(yes_price, 2) <= YES_PRICE_HIGH
-
-
 def _is_stop_time_reached() -> bool:
     """Return True if the hard stop time (5pm PST) has been reached."""
     now_pst = datetime.now(tz=STOP_TIMEZONE)
@@ -869,8 +721,8 @@ async def attempt_entry(
     Execution flow:
       1. Pre-flight book check: fetch best NO ask; if outside valid range, skip.
       2. Pre-flight balance check (under balance_lock): verify sufficient funds.
-      3. Re-fetch best NO ask inside the lock; post ONE limit order at
-         best_no_ask + SLIPPAGE_BUFFER (clamped to [0.01, 0.99]).
+      3. Re-fetch best NO ask inside the lock; post ONE limit order at exactly
+         the best NO ask price (no slippage buffer added).
       4. Poll for fill up to ORDER_HOLD_SEC (1 hour).
       5. If filled  → log via _log_filled with maker fee rate (1.75%) and return
          {"executed": True}.
@@ -908,11 +760,6 @@ async def attempt_entry(
     except Exception:
         signal_local = ""
 
-    # ── Detect market type (set after market_obj is fetched below) ────────────
-    # Initialised to False; overwritten once market_obj is available so the
-    # rest of the function can branch without re-testing the ticker each time.
-    _bracket: bool = False
-
     # ── Common CSV row scaffold ───────────────────────────────────────────────
     def _base_row() -> dict:
         return {
@@ -925,7 +772,7 @@ async def attempt_entry(
             "signal_time_utc":   signal_trade.get("created_time", ""),
             "signal_time_local": signal_local,
             "order_id":          "",
-            "order_side":        "yes" if _bracket else "no",
+            "order_side":        "no",
             "order_limit_price": "",
             "order_status":      "",
             "filled_count":      "",
@@ -945,41 +792,21 @@ async def attempt_entry(
         logging.error(f"Could not fetch market object for {ticker}: {exc}")
         return {"executed": False}
 
-    # Set bracket flag now that we have the full market object.
-    _bracket = is_bracket_market(market_obj)
-
     # ── Pre-flight: book check ────────────────────────────────────────────────
-    if _bracket:
-        # Bracket market: we will sell YES; check best YES ask price.
-        initial_ask = await get_best_yes_ask(kalshi, market_obj)
-        if initial_ask is None:
-            initial_ask = yes_price_dollars
-            logging.debug(
-                f"{ticker}: order book unavailable — using trade yes_price "
-                f"{yes_price_dollars:.2f} as fallback YES ask."
-            )
-        if not _is_yes_price_in_range(initial_ask):
-            async with csv_lock:
-                log_skip(writer, csv_file, ticker, city, signal_trade, "price_drifted_out_of_range")
-            return {"executed": False}
-        # Cost of selling YES = yes limit price (we receive this, but risk $1 if wrong).
-        # Use the signal yes_price as the balance-check cost estimate.
-        cost_check_price = round(1.0 - max(initial_ask - SLIPPAGE_BUFFER, 0.01), 2)
-    else:
-        # Threshold market: we will buy NO.
-        initial_ask = await get_best_no_ask(kalshi, market_obj)
-        if initial_ask is None:
-            initial_ask = no_price_raw
-            logging.debug(
-                f"{ticker}: order book unavailable — using trade no_price "
-                f"{no_price_raw:.2f} as fallback ask."
-            )
-        if not _is_no_price_in_range(initial_ask):
-            async with csv_lock:
-                log_skip(writer, csv_file, ticker, city, signal_trade, "price_drifted_out_of_range")
-            return {"executed": False}
-        # Cost estimate for the balance check.
-        cost_check_price = round(min(initial_ask + SLIPPAGE_BUFFER, 0.99), 2)
+    # All markets: buy NO at the exact best NO ask price.
+    initial_ask = await get_best_no_ask(kalshi, market_obj)
+    if initial_ask is None:
+        initial_ask = no_price_raw
+        logging.debug(
+            f"{ticker}: order book unavailable — using trade no_price "
+            f"{no_price_raw:.2f} as fallback ask."
+        )
+    if not _is_no_price_in_range(initial_ask):
+        async with csv_lock:
+            log_skip(writer, csv_file, ticker, city, signal_trade, "price_drifted_out_of_range")
+        return {"executed": False}
+    # Cost estimate for the balance check — use the raw ask price directly.
+    cost_check_price = initial_ask
 
     # ── Shared finalize-and-log helper ────────────────────────────────────────
     async def _log_filled(
@@ -991,10 +818,7 @@ async def attempt_entry(
         order_id_str  = order_obj.order_id if order_obj else ""
         status_str    = order_obj.status.value if order_obj else "unknown"
         fill_count_fp = (order_obj.fill_count_fp or "0") if order_obj else "0"
-        if _bracket:
-            avg_price_str = (order_obj.yes_price_dollars or "") if order_obj else ""
-        else:
-            avg_price_str = (order_obj.no_price_dollars or "") if order_obj else ""
+        avg_price_str = (order_obj.no_price_dollars or "") if order_obj else ""
         est_fee       = math.ceil(0.0175 * min(yes_price_dollars, 1 - yes_price_dollars) * 100) / 100
 
         bal_after = ""
@@ -1020,9 +844,8 @@ async def attempt_entry(
             log_row(writer, row)
             csv_file.flush()
 
-        side_label = "YES(sell)" if _bracket else "NO"
         logging.info(
-            f"ORDER FILLED | {city} | {ticker} | {side_label} @ {limit_price:.2f} | "
+            f"ORDER FILLED | {city} | {ticker} | NO @ {limit_price:.2f} | "
             f"order_id={order_id_str} | type={order_type_label} | "
             f"filled={fill_count_fp} | est_fee=${est_fee:.2f}"
         )
@@ -1055,62 +878,36 @@ async def attempt_entry(
         # Record the balance snapshot while still holding the lock.
         balance = available
 
-        # Re-fetch best ask inside the lock to get the freshest price.
-        if _bracket:
-            best_ask = await get_best_yes_ask(kalshi, market_obj) or yes_price_dollars
-            if not _is_yes_price_in_range(best_ask):
-                async with csv_lock:
-                    log_skip(writer, csv_file, ticker, city, signal_trade, "price_drifted_out_of_range")
-                return {"executed": False}
-        else:
-            best_ask = await get_best_no_ask(kalshi, market_obj) or no_price_raw
-            if not _is_no_price_in_range(best_ask):
-                async with csv_lock:
-                    log_skip(writer, csv_file, ticker, city, signal_trade, "price_drifted_out_of_range")
-                return {"executed": False}
+        # Re-fetch best NO ask inside the lock to get the freshest price.
+        best_ask = await get_best_no_ask(kalshi, market_obj) or no_price_raw
+        if not _is_no_price_in_range(best_ask):
+            async with csv_lock:
+                log_skip(writer, csv_file, ticker, city, signal_trade, "price_drifted_out_of_range")
+            return {"executed": False}
 
         if _is_stop_time_reached():
             async with csv_lock:
                 log_skip(writer, csv_file, ticker, city, signal_trade, "stop_time_reached_during_fill_wait")
             return {"executed": False}
 
-        if _bracket:
-            # Sell YES one tick below the best YES ask.
-            limit_price = max(best_ask - SLIPPAGE_BUFFER, 0.01)
-        else:
-            # Buy NO one tick above the best NO ask.
-            limit_price = min(best_ask + SLIPPAGE_BUFFER, 0.99)
+        # Place the limit order at exactly the best NO ask — no slippage buffer.
+        limit_price = best_ask
 
         client_oid = f"yb_le_{ticker}_{uuid.uuid4().hex[:12]}"
 
-        if _bracket:
-            logging.info(
-                f"LIMIT ENTRY | {city} | {ticker} | "
-                f"posting YES(sell) @ {limit_price:.2f} (ask={best_ask:.2f}, -{SLIPPAGE_BUFFER} tick)"
-            )
-        else:
-            logging.info(
-                f"LIMIT ENTRY | {city} | {ticker} | "
-                f"posting NO @ {limit_price:.2f} (ask={best_ask:.2f}, +{SLIPPAGE_BUFFER} tick)"
-            )
+        logging.info(
+            f"LIMIT ENTRY | {city} | {ticker} | "
+            f"posting NO @ {limit_price:.2f} (ask={best_ask:.2f})"
+        )
 
         try:
-            if _bracket:
-                _order_result = await place_yes_sell_order(
-                    kalshi            = kalshi,
-                    market            = market_obj,
-                    count             = MIN_CONTRACTS,
-                    yes_price_dollars = limit_price,
-                    client_order_id   = client_oid,
-                )
-            else:
-                _order_result = await place_no_order(
-                    kalshi           = kalshi,
-                    market           = market_obj,
-                    count            = MIN_CONTRACTS,
-                    no_price_dollars = limit_price,
-                    client_order_id  = client_oid,
-                )
+            _order_result = await place_no_order(
+                kalshi           = kalshi,
+                market           = market_obj,
+                count            = MIN_CONTRACTS,
+                no_price_dollars = limit_price,
+                client_order_id  = client_oid,
+            )
         except InsufficientFundsError as exc:
             logging.error(f"{ticker} [limit_entry]: insufficient funds: {exc}")
             _place_error = f"insufficient_funds_api:{exc}"
@@ -1132,10 +929,9 @@ async def attempt_entry(
         return {"executed": False}
 
     order_placed = _order_result
-    _resting_side_label = "YES(sell)" if _bracket else "NO"
     logging.info(
         f"ORDER RESTING | {city} | {ticker} | stage=limit_entry | "
-        f"{_resting_side_label} @ {limit_price:.2f} | order_id={order_placed.order_id}"
+        f"NO @ {limit_price:.2f} | order_id={order_placed.order_id}"
     )
 
     # ── Poll for fill (yields to event loop between polls) ────────────────────
@@ -1390,22 +1186,12 @@ async def check_and_record_settlements(kalshi: AsyncKalshiClient) -> None:
                 try:
                     filled_count = float(row.get("filled_count", "0") or "0")
                     avg_price    = float(row.get("filled_avg_price", "0") or "0")
-                    ticker_str   = row.get("ticker", "")
-                    is_bracket   = bool(re.search(r"-B\d", ticker_str))
-                    if is_bracket:
-                        # Sold YES at avg_price; win = keep premium, loss = pay out $1
-                        pnl = (
-                            round(avg_price * filled_count, 4)
-                            if result_str == "no"
-                            else round(-(1.0 - avg_price) * filled_count, 4)
-                        )
-                    else:
-                        # Bought NO at avg_price; "no" = win, "yes" = loss
-                        pnl = (
-                            round((1.0 - avg_price) * filled_count, 4)
-                            if result_str == "no"
-                            else round(-avg_price * filled_count, 4)
-                        )
+                    # All positions are bought NO; "no" result = win, "yes" result = loss.
+                    pnl = (
+                        round((1.0 - avg_price) * filled_count, 4)
+                        if result_str == "no"
+                        else round(-avg_price * filled_count, 4)
+                    )
                     pnl_str = str(pnl)
                 except Exception:
                     pnl_str = ""
