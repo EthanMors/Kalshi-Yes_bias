@@ -910,12 +910,15 @@ async def attempt_entry(
             )
         except InsufficientFundsError as exc:
             logging.error(f"{ticker} [limit_entry]: insufficient funds: {exc}")
+            logging.error(f"{ticker} [limit_entry]: request_body={exc.request_body} | response_body={exc.response_body}")
             _place_error = f"insufficient_funds_api:{exc}"
         except OrderRejectedError as exc:
             logging.error(f"{ticker} [limit_entry]: order rejected: {exc}")
+            logging.error(f"{ticker} [limit_entry]: request_body={exc.request_body} | response_body={exc.response_body}")
             _place_error = f"order_rejected:{exc}"
         except (KalshiAPIError, RateLimitError) as exc:
             logging.error(f"{ticker} [limit_entry]: order submission failed: {exc}")
+            logging.error(f"{ticker} [limit_entry]: request_body={exc.request_body} | response_body={exc.response_body}")
             _place_error = f"order_error:{exc}"
         except Exception as exc:
             logging.error(f"{ticker} [limit_entry]: unexpected error placing order: {exc}")
