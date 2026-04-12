@@ -14,8 +14,8 @@
 #   export KALSHI_PRIVATE_KEY_PATH="/path/to/your/private-key.key"
 #   python yes_bias_live_deployment_trial.py
 #
-# Install dependency:
-#   # pip install pykalshi
+# Install dependencies:
+#   pip install pykalshi kalshi-python
 
 import asyncio
 import json
@@ -34,15 +34,12 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 import pandas as pd
 from pykalshi import AsyncKalshiClient, AsyncRateLimiter
-from pykalshi.enums import Action, Side, MarketStatus, OrderStatus, OrderType
-from pykalshi.portfolio import Portfolio as _Portfolio
-from pykalshi.exceptions import (
-    KalshiAPIError,
-    InsufficientFundsError,
-    RateLimitError,
-    OrderRejectedError,
-    AuthenticationError,
-)
+from pykalshi.enums import MarketStatus, OrderStatus, OrderType
+from pykalshi.exceptions import AuthenticationError
+# kalshi-python (official Kalshi OpenAPI client) — used for order placement only.
+import kalshi_python
+from kalshi_python.api.portfolio_api import PortfolioApi as KalshiPortfolioApi
+from kalshi_python.models import CreateOrderRequest
 load_dotenv()
 from orderbook_collector import OrderBookCollector
 # ── Account ─────────────────────────────────────────────────────────────────────
@@ -86,6 +83,7 @@ SETTLEMENT_LOG_PATH = Path(__file__).parent / "settlement_log.csv"
 LOG_FILE            = Path(__file__).parent / "yes_bias_bot.log"
 LOG_LEVEL           = logging.INFO
 JSON_LOG_DIR        = Path(__file__).parent / "JSON_logs"
+ERROR_400_LOG_PATH  = Path(__file__).parent / "indepth_error_400.log"
 
 # ── Settlement log columns ────────────────────────────────────────────────────────
 SETTLEMENT_COLUMNS = [
@@ -335,23 +333,23 @@ async def place_no_order(
     no_price_dollars: float,
     client_order_id: str,
 ) -> object:
-    """Submit a limit buy-NO order via pykalshi.
+    """Submit a limit buy-NO order via kalshi-python (official Kalshi OpenAPI client).
+
+    kalshi-python is synchronous; the actual HTTP call is offloaded to a thread
+    executor so the async event loop is never blocked.
 
     Args:
-        kalshi:            Authenticated AsyncKalshiClient instance.
-        market:            Market object from kalshi.get_market() — enables pykalshi
-                           tick-size validation (skipped when a string is passed).
+        kalshi:            Authenticated AsyncKalshiClient instance (used for
+                           tick-snap metadata only — not for the API call).
+        market:            Market object from kalshi.get_market().
         count:             Number of whole contracts.
-        no_price_dollars:  Limit price in dollars (e.g. 0.43). Snapped to whole cents.
+        no_price_dollars:  Limit price in dollars (e.g. 0.43). Snapped to valid tick.
         client_order_id:   Idempotency key.
 
     Returns:
-        pykalshi AsyncOrder object.
+        kalshi_python.models.Order object (has .order_id, .status, .no_price, etc.).
     """
-    # pykalshi expects count as a fixed-point string (e.g. "1.00").
-    count_fp = f"{count}.00"
-    # Snap to the market's tick grid (linear_cent → 0.01, deci_cent → 0.001,
-    # tapered_deci_cent → 0.001 in tails / 0.01 in mid-range).
+    # Snap to the market's tick grid.
     no_price_str = snap_to_tick(no_price_dollars, market)
     pls = getattr(market, "price_level_structure", "linear_cent") or "linear_cent"
     logging.debug(
@@ -359,31 +357,35 @@ async def place_no_order(
         f"raw={no_price_dollars} → snapped={no_price_str}"
     )
 
-    # Capture the exact request body before submission for audit logging.
-    try:
-        _request_body = _Portfolio._build_order_data(
-            market,
-            Action.BUY,
-            Side.NO,
-            count_fp,
-            no_price_dollars=no_price_str,
-            client_order_id=client_order_id,
-        )
-    except Exception as _bd_exc:
-        logging.warning(f"place_no_order: could not build order data for log: {_bd_exc}")
-        _request_body = {}
-
     _ticker_str = getattr(market, "ticker", str(market))
-    _market_type = "bracket" if re.search(r"-B\d", _ticker_str) else "threshold"  # informational only
+    _market_type = "bracket" if re.search(r"-B\d", _ticker_str) else "threshold"
+
+    # Kalshi API expects NO price as a dollar decimal rounded to 4 decimal places
+    # (e.g. 0.3600), NOT as integer cents.  model_construct bypasses the SDK's
+    # ge=1 Pydantic constraint which was written for the old cents format.
+    no_price_4dp = round(float(no_price_str), 4)
+
+    # Build the request for audit logging and submission.
+    order_request = CreateOrderRequest.model_construct(
+        ticker          = _ticker_str,
+        client_order_id = client_order_id,
+        action          = "buy",
+        side            = "no",
+        count           = count,
+        type            = "limit",
+        no_price        = no_price_4dp,
+    )
+    _request_body = order_request.to_dict()
 
     try:
-        result = await kalshi.portfolio.place_order(
-            ticker          = market,
-            action          = Action.BUY,
-            side            = Side.NO,
-            count_fp        = count_fp,
-            no_price_dollars= no_price_str,
-            client_order_id = client_order_id,
+        # Run the synchronous kalshi-python call in a thread so we don't block
+        # the event loop while waiting for the HTTP response.
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: _kp_portfolio.create_order(
+                create_order_request=order_request,
+            ),
         )
     except Exception as exc:
         _write_jsonl_log({
@@ -395,18 +397,20 @@ async def place_no_order(
             "error_type":    type(exc).__name__,
             "error_message": str(exc),
         })
+        _log_error_400(exc, _ticker_str, "place_no_order", request_body=_request_body)
         raise
 
+    order = response.order
     _write_jsonl_log({
-        "timestamp_utc":    datetime.now(tz=timezone.utc).isoformat(),
-        "event":            "order_placed",
-        "ticker":           _ticker_str,
-        "market_type":      _market_type,
-        "request_body":     _request_body,
-        "response_order_id": result.order_id,
-        "response_status":  result.status.value if hasattr(result.status, "value") else str(result.status),
+        "timestamp_utc":     datetime.now(tz=timezone.utc).isoformat(),
+        "event":             "order_placed",
+        "ticker":            _ticker_str,
+        "market_type":       _market_type,
+        "request_body":      _request_body,
+        "response_order_id": order.order_id,
+        "response_status":   order.status if isinstance(order.status, str) else str(order.status),
     })
-    return result
+    return order
 
 
 async def get_order_status(kalshi: AsyncKalshiClient, order_id: str) -> object:
@@ -458,6 +462,47 @@ def log_row(writer: csv.DictWriter, row: dict) -> None:
     # DictWriter does not expose the underlying file directly; flush via
     # the writer's internal reference stored in the calling scope.
     # Flushing is handled by the caller using csv_file.flush().
+
+
+def _log_error_400(exc: Exception, ticker: str, context: str, request_body: dict | None = None) -> None:
+    """Append a detailed entry to indepth_error_400.log whenever Kalshi returns a 400.
+
+    Handles both pykalshi (exc.status_code) and kalshi-python (exc.status)
+    exception shapes. Only fires on 400 responses; all errors are swallowed so
+    this can never crash the bot.
+    """
+    # Support both pykalshi (status_code) and kalshi-python (status) attribute names.
+    status_code = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status_code != 400:
+        return
+    try:
+        timestamp = datetime.now(tz=timezone.utc).isoformat()
+        separator = "=" * 70
+        lines = [
+            separator,
+            f"TIMESTAMP   : {timestamp}",
+            f"TICKER      : {ticker}",
+            f"CONTEXT     : {context}",
+            f"EXCEPTION   : {type(exc).__name__}",
+            f"STATUS CODE : {status_code}",
+            f"ERROR CODE  : {getattr(exc, 'error_code', None)}",
+            f"MESSAGE     : {getattr(exc, 'message', None) or getattr(exc, 'reason', str(exc))}",
+            f"METHOD      : {getattr(exc, 'method', None)}",
+            f"ENDPOINT    : {getattr(exc, 'endpoint', None)}",
+            f"REQUEST BODY:",
+            json.dumps(request_body or getattr(exc, "request_body", None), indent=2, default=str),
+            f"RESPONSE BODY:",
+            json.dumps(
+                getattr(exc, "response_body", None) or getattr(exc, "body", None),
+                indent=2, default=str
+            ),
+            separator,
+            "",
+        ]
+        with open(ERROR_400_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines))
+    except Exception as log_exc:
+        logging.warning(f"_log_error_400 failed (entry not saved): {log_exc}")
 
 
 def _write_jsonl_log(record: dict) -> None:
@@ -908,18 +953,23 @@ async def attempt_entry(
                 no_price_dollars = limit_price,
                 client_order_id  = client_oid,
             )
-        except InsufficientFundsError as exc:
-            logging.error(f"{ticker} [limit_entry]: insufficient funds: {exc}")
-            logging.error(f"{ticker} [limit_entry]: request_body={exc.request_body} | response_body={exc.response_body}")
-            _place_error = f"insufficient_funds_api:{exc}"
-        except OrderRejectedError as exc:
-            logging.error(f"{ticker} [limit_entry]: order rejected: {exc}")
-            logging.error(f"{ticker} [limit_entry]: request_body={exc.request_body} | response_body={exc.response_body}")
-            _place_error = f"order_rejected:{exc}"
-        except (KalshiAPIError, RateLimitError) as exc:
-            logging.error(f"{ticker} [limit_entry]: order submission failed: {exc}")
-            logging.error(f"{ticker} [limit_entry]: request_body={exc.request_body} | response_body={exc.response_body}")
-            _place_error = f"order_error:{exc}"
+        except kalshi_python.exceptions.ApiException as exc:
+            # kalshi-python raises ApiException (and sub-classes like
+            # BadRequestException, UnauthorizedException, etc.) for HTTP errors.
+            status_code = getattr(exc, "status", None)
+            body        = getattr(exc, "body", None)
+            reason      = getattr(exc, "reason", None)
+            logging.error(
+                f"{ticker} [limit_entry]: kalshi API error "
+                f"status={status_code} reason={reason} body={body}"
+            )
+            if status_code == 429:
+                _place_error = f"rate_limit:{exc}"
+            elif status_code == 400:
+                # Treat 400 as an order rejection / bad request.
+                _place_error = f"order_rejected_400:{exc}"
+            else:
+                _place_error = f"order_error:{exc}"
         except Exception as exc:
             logging.error(f"{ticker} [limit_entry]: unexpected error placing order: {exc}")
             _place_error = f"order_error:{exc}"
@@ -1447,6 +1497,26 @@ async def async_main() -> None:
         logging.critical(f"Failed to instantiate AsyncKalshiClient: {exc}")
         sys.exit(1)
 
+    # ── Build kalshi-python client for order placement ────────────────────────
+    # kalshi-python is the official Kalshi OpenAPI client (synchronous).
+    # It handles RSA-PSS auth natively via KalshiAuth inside ApiClient.
+    global _kp_portfolio
+    try:
+        _kp_api_client = kalshi_python.ApiClient(
+            configuration=kalshi_python.Configuration(
+                host="https://api.elections.kalshi.com/trade-api/v2"
+            )
+        )
+        _kp_api_client.set_kalshi_auth(
+            key_id           = KALSHI_API_KEY_ID,
+            private_key_path = KALSHI_PRIVATE_KEY_PATH,
+        )
+        _kp_portfolio = KalshiPortfolioApi(_kp_api_client)
+        logging.info("kalshi-python PortfolioApi initialised for order placement.")
+    except Exception as exc:
+        logging.critical(f"Failed to initialise kalshi-python client: {exc}")
+        sys.exit(1)
+
     async with kalshi:
         await validate_api_connection(kalshi)
 
@@ -1698,6 +1768,10 @@ async def async_main() -> None:
 # Prevents the supervisor from spawning duplicate coroutines for the same ticker.
 # Modified only from within the event loop — no lock needed (single-threaded asyncio).
 _active_tickers: set[str] = set()
+
+# kalshi-python PortfolioApi instance — initialised in async_main() and used
+# exclusively by place_no_order() for order submission.
+_kp_portfolio: KalshiPortfolioApi | None = None
 
 
 async def _ticker_task_wrapper(
