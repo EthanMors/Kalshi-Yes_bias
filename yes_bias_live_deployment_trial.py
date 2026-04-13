@@ -15,9 +15,10 @@
 #   python yes_bias_live_deployment_trial.py
 #
 # Install dependencies:
-#   pip install pykalshi kalshi-python
+#   pip install pykalshi httpx cryptography
 
 import asyncio
+import base64
 import json
 import math
 import csv
@@ -26,20 +27,20 @@ import os
 import re
 import sys
 import time
+import types
 import uuid
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
+import httpx
 import pandas as pd
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from pykalshi import AsyncKalshiClient, AsyncRateLimiter
 from pykalshi.enums import MarketStatus, OrderStatus, OrderType
 from pykalshi.exceptions import AuthenticationError
-# kalshi-python (official Kalshi OpenAPI client) — used for order placement only.
-import kalshi_python
-from kalshi_python.api.portfolio_api import PortfolioApi as KalshiPortfolioApi
-from kalshi_python.models import CreateOrderRequest
 load_dotenv()
 from orderbook_collector import OrderBookCollector
 # ── Account ─────────────────────────────────────────────────────────────────────
@@ -326,6 +327,28 @@ async def get_best_no_ask(kalshi: AsyncKalshiClient, market) -> float | None:
     return None
 
 
+def _build_kalshi_auth_headers(method: str, path: str) -> dict:
+    """Build Kalshi RSA-PSS auth headers for a given HTTP method and path."""
+    ts_ms = str(int(time.time() * 1000))
+    msg = (ts_ms + method.upper() + path).encode()
+    with open(KALSHI_PRIVATE_KEY_PATH, "rb") as fh:
+        private_key = serialization.load_pem_private_key(fh.read(), password=None)
+    sig = private_key.sign(
+        msg,
+        asym_padding.PSS(
+            mgf=asym_padding.MGF1(hashes.SHA256()),
+            salt_length=asym_padding.PSS.DIGEST_SIZE,
+        ),
+        hashes.SHA256(),
+    )
+    return {
+        "KALSHI-ACCESS-KEY":       KALSHI_API_KEY_ID,
+        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+        "Content-Type":            "application/json",
+    }
+
+
 async def place_no_order(
     kalshi: AsyncKalshiClient,
     market: object,
@@ -333,10 +356,11 @@ async def place_no_order(
     no_price_dollars: float,
     client_order_id: str,
 ) -> object:
-    """Submit a limit buy-NO order via kalshi-python (official Kalshi OpenAPI client).
+    """Submit a limit buy-NO order directly via httpx + RSA-PSS auth.
 
-    kalshi-python is synchronous; the actual HTTP call is offloaded to a thread
-    executor so the async event loop is never blocked.
+    Builds the JSON body with string-typed count_fp and price fields as required
+    by the Kalshi REST API v2.  No third-party order SDK — full control over the
+    request shape.
 
     Args:
         kalshi:            Authenticated AsyncKalshiClient instance (used for
@@ -347,7 +371,7 @@ async def place_no_order(
         client_order_id:   Idempotency key.
 
     Returns:
-        kalshi_python.models.Order object (has .order_id, .status, .no_price, etc.).
+        SimpleNamespace with .order_id and .status from the API response.
     """
     # Snap to the market's tick grid.
     no_price_str = snap_to_tick(no_price_dollars, market)
@@ -360,33 +384,29 @@ async def place_no_order(
     _ticker_str = getattr(market, "ticker", str(market))
     _market_type = "bracket" if re.search(r"-B\d", _ticker_str) else "threshold"
 
-    # Kalshi API expects NO price as a dollar decimal rounded to 4 decimal places
-    # (e.g. 0.3600), NOT as integer cents.  model_construct bypasses the SDK's
-    # ge=1 Pydantic constraint which was written for the old cents format.
-    no_price_4dp = round(float(no_price_str), 4)
+    no_price_4dp  = round(float(no_price_str), 4)
+    yes_price_4dp = round(1.0 - no_price_4dp, 4)
 
-    # Build the request for audit logging and submission.
-    order_request = CreateOrderRequest.model_construct(
-        ticker          = _ticker_str,
-        client_order_id = client_order_id,
-        action          = "buy",
-        side            = "no",
-        count           = count,
-        type            = "limit",
-        no_price        = no_price_4dp,
-    )
-    _request_body = order_request.to_dict()
+    # Build JSON body with exact field names and types required by Kalshi API v2.
+    _request_body = {
+        "ticker":            _ticker_str,
+        "client_order_id":   client_order_id,
+        "action":            "buy",
+        "side":              "no",
+        "type":              "limit",
+        "count_fp":          f"{count}.00",
+        "no_price_dollars":  f"{no_price_4dp:.4f}",
+        "yes_price_dollars": f"{yes_price_4dp:.4f}",
+    }
+
+    _API_PATH = "/trade-api/v2/portfolio/orders"
+    _API_URL  = "https://api.elections.kalshi.com" + _API_PATH
+    headers   = _build_kalshi_auth_headers("POST", _API_PATH)
 
     try:
-        # Run the synchronous kalshi-python call in a thread so we don't block
-        # the event loop while waiting for the HTTP response.
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: _kp_portfolio.create_order(
-                create_order_request=order_request,
-            ),
-        )
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(_API_URL, json=_request_body, headers=headers)
+            resp.raise_for_status()
     except Exception as exc:
         _write_jsonl_log({
             "timestamp_utc": datetime.now(tz=timezone.utc).isoformat(),
@@ -400,7 +420,11 @@ async def place_no_order(
         _log_error_400(exc, _ticker_str, "place_no_order", request_body=_request_body)
         raise
 
-    order = response.order
+    _ord = resp.json().get("order", {})
+    order = types.SimpleNamespace(
+        order_id = _ord.get("order_id", ""),
+        status   = _ord.get("status", ""),
+    )
     _write_jsonl_log({
         "timestamp_utc":     datetime.now(tz=timezone.utc).isoformat(),
         "event":             "order_placed",
@@ -408,7 +432,7 @@ async def place_no_order(
         "market_type":       _market_type,
         "request_body":      _request_body,
         "response_order_id": order.order_id,
-        "response_status":   order.status if isinstance(order.status, str) else str(order.status),
+        "response_status":   order.status,
     })
     return order
 
@@ -953,12 +977,11 @@ async def attempt_entry(
                 no_price_dollars = limit_price,
                 client_order_id  = client_oid,
             )
-        except kalshi_python.exceptions.ApiException as exc:
-            # kalshi-python raises ApiException (and sub-classes like
-            # BadRequestException, UnauthorizedException, etc.) for HTTP errors.
-            status_code = getattr(exc, "status", None)
-            body        = getattr(exc, "body", None)
-            reason      = getattr(exc, "reason", None)
+        except httpx.HTTPStatusError as exc:
+            # httpx raises HTTPStatusError for 4xx/5xx responses.
+            status_code = exc.response.status_code
+            body        = exc.response.text
+            reason      = exc.response.reason_phrase
             logging.error(
                 f"{ticker} [limit_entry]: kalshi API error "
                 f"status={status_code} reason={reason} body={body}"
@@ -1497,25 +1520,7 @@ async def async_main() -> None:
         logging.critical(f"Failed to instantiate AsyncKalshiClient: {exc}")
         sys.exit(1)
 
-    # ── Build kalshi-python client for order placement ────────────────────────
-    # kalshi-python is the official Kalshi OpenAPI client (synchronous).
-    # It handles RSA-PSS auth natively via KalshiAuth inside ApiClient.
-    global _kp_portfolio
-    try:
-        _kp_api_client = kalshi_python.ApiClient(
-            configuration=kalshi_python.Configuration(
-                host="https://api.elections.kalshi.com/trade-api/v2"
-            )
-        )
-        _kp_api_client.set_kalshi_auth(
-            key_id           = KALSHI_API_KEY_ID,
-            private_key_path = KALSHI_PRIVATE_KEY_PATH,
-        )
-        _kp_portfolio = KalshiPortfolioApi(_kp_api_client)
-        logging.info("kalshi-python PortfolioApi initialised for order placement.")
-    except Exception as exc:
-        logging.critical(f"Failed to initialise kalshi-python client: {exc}")
-        sys.exit(1)
+    logging.info("Order placement uses direct httpx + RSA-PSS (no kalshi-python).")
 
     async with kalshi:
         await validate_api_connection(kalshi)
@@ -1768,10 +1773,6 @@ async def async_main() -> None:
 # Prevents the supervisor from spawning duplicate coroutines for the same ticker.
 # Modified only from within the event loop — no lock needed (single-threaded asyncio).
 _active_tickers: set[str] = set()
-
-# kalshi-python PortfolioApi instance — initialised in async_main() and used
-# exclusively by place_no_order() for order submission.
-_kp_portfolio: KalshiPortfolioApi | None = None
 
 
 async def _ticker_task_wrapper(
