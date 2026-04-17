@@ -327,26 +327,25 @@ async def get_best_no_ask(kalshi: AsyncKalshiClient, market) -> float | None:
     return None
 
 
-def _build_kalshi_auth_headers(method: str, path: str) -> dict:
-    """Build Kalshi RSA-PSS auth headers for a given HTTP method and path."""
-    ts_ms = str(int(time.time() * 1000))
-    msg = (ts_ms + method.upper() + path).encode()
-    with open(KALSHI_PRIVATE_KEY_PATH, "rb") as fh:
-        private_key = serialization.load_pem_private_key(fh.read(), password=None)
-    sig = private_key.sign(
-        msg,
-        asym_padding.PSS(
-            mgf=asym_padding.MGF1(hashes.SHA256()),
-            salt_length=asym_padding.PSS.DIGEST_SIZE,
-        ),
-        hashes.SHA256(),
-    )
-    return {
-        "KALSHI-ACCESS-KEY":       KALSHI_API_KEY_ID,
-        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
-        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
-        "Content-Type":            "application/json",
-    }
+async def check_clock_sync(max_skew_seconds: float = 2.0) -> None:
+    """Abort if local clock is skewed vs NTP — Kalshi rejects signatures >5s off."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
+            r = await c.get("https://worldtimeapi.org/api/timezone/UTC")
+            r.raise_for_status()
+            server_epoch = r.json()["unixtime"]
+            skew = abs(time.time() - server_epoch)
+            if skew > max_skew_seconds:
+                logging.critical(
+                    f"Clock skew detected: {skew:.1f}s off NTP. "
+                    "Run 'w32tm /resync' and restart. Exiting."
+                )
+                sys.exit(1)
+            logging.info(f"Clock sync OK (skew {skew:.2f}s).")
+    except SystemExit:
+        raise
+    except Exception as exc:
+        logging.warning(f"Clock sync check failed (non-fatal): {exc}")
 
 
 async def place_no_order(
@@ -356,15 +355,10 @@ async def place_no_order(
     no_price_dollars: float,
     client_order_id: str,
 ) -> object:
-    """Submit a limit buy-NO order directly via httpx + RSA-PSS auth.
-
-    Builds the JSON body with string-typed count_fp and price fields as required
-    by the Kalshi REST API v2.  No third-party order SDK — full control over the
-    request shape.
+    """Submit a limit buy-NO order via the SDK's authenticated post().
 
     Args:
-        kalshi:            Authenticated AsyncKalshiClient instance (used for
-                           tick-snap metadata only — not for the API call).
+        kalshi:            Authenticated AsyncKalshiClient instance.
         market:            Market object from kalshi.get_market().
         count:             Number of whole contracts.
         no_price_dollars:  Limit price in dollars (e.g. 0.43). Snapped to valid tick.
@@ -373,7 +367,6 @@ async def place_no_order(
     Returns:
         SimpleNamespace with .order_id and .status from the API response.
     """
-    # Snap to the market's tick grid.
     no_price_str = snap_to_tick(no_price_dollars, market)
     pls = getattr(market, "price_level_structure", "linear_cent") or "linear_cent"
     logging.debug(
@@ -384,29 +377,20 @@ async def place_no_order(
     _ticker_str = getattr(market, "ticker", str(market))
     _market_type = "bracket" if re.search(r"-B\d", _ticker_str) else "threshold"
 
-    no_price_4dp  = round(float(no_price_str), 4)
-    yes_price_4dp = round(1.0 - no_price_4dp, 4)
+    no_price_cents = int(round(float(no_price_str) * 100))
 
-    # Build JSON body with exact field names and types required by Kalshi API v2.
     _request_body = {
-        "ticker":            _ticker_str,
-        "client_order_id":   client_order_id,
-        "action":            "buy",
-        "side":              "no",
-        "type":              "limit",
-        "count_fp":          f"{count}.00",
-        "no_price_dollars":  f"{no_price_4dp:.4f}",
-        "yes_price_dollars": f"{yes_price_4dp:.4f}",
+        "ticker":           _ticker_str,
+        "client_order_id":  client_order_id,
+        "action":           "buy",
+        "side":             "no",
+        "type":             "limit",
+        "count":            count,
+        "no_price":         no_price_cents,
     }
 
-    _API_PATH = "/trade-api/v2/portfolio/orders"
-    _API_URL  = "https://api.elections.kalshi.com" + _API_PATH
-    headers   = _build_kalshi_auth_headers("POST", _API_PATH)
-
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(_API_URL, json=_request_body, headers=headers)
-            resp.raise_for_status()
+        resp = await kalshi.post("/trade-api/v2/portfolio/orders", _request_body)
     except Exception as exc:
         _write_jsonl_log({
             "timestamp_utc": datetime.now(tz=timezone.utc).isoformat(),
@@ -420,10 +404,10 @@ async def place_no_order(
         _log_error_400(exc, _ticker_str, "place_no_order", request_body=_request_body)
         raise
 
-    _ord = resp.json().get("order", {})
+    _ord = resp.get("order", {})
     order = types.SimpleNamespace(
-        order_id = _ord.get("order_id", ""),
-        status   = _ord.get("status", ""),
+        order_id=_ord.get("order_id", ""),
+        status=_ord.get("status", ""),
     )
     _write_jsonl_log({
         "timestamp_utc":     datetime.now(tz=timezone.utc).isoformat(),
@@ -959,14 +943,14 @@ async def attempt_entry(
                 log_skip(writer, csv_file, ticker, city, signal_trade, "stop_time_reached_during_fill_wait")
             return {"executed": False}
 
-        # Place the limit order at exactly the best NO ask — no slippage buffer.
-        limit_price = best_ask
+        # Place the limit order 1 cent above the best NO ask to improve fill probability.
+        limit_price = float(snap_to_tick(best_ask + 0.01, market_obj))
 
         client_oid = f"yb_le_{ticker}_{uuid.uuid4().hex[:12]}"
 
         logging.info(
             f"LIMIT ENTRY | {city} | {ticker} | "
-            f"posting NO @ {limit_price:.2f} (ask={best_ask:.2f})"
+            f"posting NO @ {limit_price:.4f} (ask={best_ask:.4f}, +1¢ buffer)"
         )
 
         try:
@@ -1520,9 +1504,8 @@ async def async_main() -> None:
         logging.critical(f"Failed to instantiate AsyncKalshiClient: {exc}")
         sys.exit(1)
 
-    logging.info("Order placement uses direct httpx + RSA-PSS (no kalshi-python).")
-
     async with kalshi:
+        await check_clock_sync()
         await validate_api_connection(kalshi)
 
         # ── Morning settlement check ─────────────────────────────────────────
